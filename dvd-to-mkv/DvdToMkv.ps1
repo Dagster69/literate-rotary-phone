@@ -182,8 +182,9 @@ function Set-ItemStatus($item, [string]$status) {
 }
 
 function Update-Progress($item, [long]$curBytes) {
-    if ($item.Bytes -gt 0) { $pct = [math]::Min(100, [math]::Round($curBytes * 100.0 / $item.Bytes)) } else { $pct = 0 }
-    $done = $script:DoneBytes + [math]::Min($curBytes, $item.Bytes)
+    $pct = 0.0
+    if ($item.Bytes -gt 0) { $pct = [math]::Min([double]100, [math]::Round([double]$curBytes * 100.0 / [double]$item.Bytes)) }
+    $done = [double]$script:DoneBytes + [math]::Min([double]$curBytes, [double]$item.Bytes)
     $elapsed = ((Get-Date) - $script:BatchStart).TotalSeconds
     if ($done -gt 0 -and $elapsed -gt 20) {
         $left = ($script:TotalBytes - $done) / ($done / $elapsed)
@@ -191,7 +192,7 @@ function Update-Progress($item, [long]$curBytes) {
     } else { $eta = 'working it out...' }
     if ($script:Gui) {
         $script:pbCur.Value = [int]$pct
-        if ($script:TotalBytes -gt 0) { $script:pbAll.Value = [int][math]::Min(100, [math]::Round($done * 100.0 / $script:TotalBytes)) }
+        if ($script:TotalBytes -gt 0) { $script:pbAll.Value = [int][math]::Min([double]100, [math]::Round($done * 100.0 / [double]$script:TotalBytes)) }
         $script:lblCur.Text = ('Now: {0}\{1}   {2}%' -f $item.Genre, $item.Name, $pct)
         $script:lblAll.Text = ('Overall: {0} of {1} movies, {2:N0} of {3:N0} GB, about {4} left' -f ($script:DoneCount + 1), $script:TotalCount, ($done / 1GB), ($script:TotalBytes / 1GB), $eta)
     }
@@ -242,7 +243,7 @@ function Convert-One($item) {
     $size = (Get-Item -LiteralPath $part).Length
     $dur = Get-MkvDuration $part
     $aud = Get-MkvAudioCount $part
-    $ratio = $size / [math]::Max(1, $item.Bytes)
+    $ratio = [double]$size / [math]::Max([double]1, [double]$item.Bytes)
     $problems = @()
     if ($dur -le 0) { $problems += 'no length found' }
     elseif ($dur -lt 600) { $problems += ('only {0} long' -f (Format-Span $dur)) }
@@ -282,7 +283,10 @@ function Start-Batch($items, [string]$outRoot) {
         Write-Log ("START  {0}\{1}" -f $it.Genre, $it.Name)
         $t0 = Get-Date
         try { $r = Convert-One $it }
-        catch { $r = [pscustomobject]@{ Ok = $false; Fatal = $false; Note = 'Error: ' + $_.Exception.Message } }
+        catch {
+            Remove-Item -LiteralPath ($it.Out + '.partial') -Force -ErrorAction SilentlyContinue
+            $r = [pscustomobject]@{ Ok = $false; Fatal = $false; Note = 'Error: ' + $_.Exception.Message }
+        }
         $secs = [int]((Get-Date) - $t0).TotalSeconds
 
         if ($r.Ok) {
