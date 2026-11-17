@@ -17,6 +17,23 @@ Converts DVD folders (`VIDEO_TS`) into single MKV files for Jellyfin, with a win
 4. **Do a test first.** Press **Untick all**, then tick 3 or 4 movies and press **Start**. Play the results in VLC and check the length, picture, sound and subtitles.
 5. When happy, press **Tick all** and **Start**. It runs one movie at a time, shows progress and time left, and can be stopped at any time with **Stop**.
 
+## Working through a big library in rounds
+
+If the output drive can't hold everything at once, convert a few genres at a time:
+
+1. Pick a genre in the drop-down (it shows how many movies and how many GB) and press **Tick genre**. Repeat for more genres. The line under the list shows the total ticked and the free space, and turns red if it won't fit.
+2. Press **Start**.
+3. When it finishes, review the results (below) and watch a sample of files.
+4. Only then delete that round's original DVD folders in Explorer, **and empty the NAS recycle bin** (`@Recycle`), otherwise the space isn't freed.
+5. Press **Scan** again and do the next round.
+
+The converter never deletes anything itself.
+
+## Checking the results
+
+- Each finished movie is compared with the length the DVD itself reports. If they differ by more than 90 seconds or 3%, the status shows an orange **Done - CHECK** and the file is kept, so you can look at it.
+- `DvdToMkv_results.csv` in Documents has one row per movie: result, DVD and MKV sizes and lengths, number of audio and subtitle tracks, and the paths. Open it in Excel and filter the Result column for CHECK or FAILED, and sort by SubtitleTracks to spot any that came out with none.
+
 ## How it behaves
 
 - **Safe to stop and restart.** Each file is written as `.partial` and only renamed once it passes checks (sensible length, has audio, size close to the DVD). Finished movies show as Done and are skipped next time.

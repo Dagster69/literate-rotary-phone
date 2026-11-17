@@ -57,6 +57,10 @@ public static class DiskInfo {
 $script:Gui = $false
 $script:StopRequested = $false
 $script:Running = $false
+$script:Bulk = $false
+$script:FreeGB = -1
+$script:GenreNames = @()
+$script:ResultsFile = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'DvdToMkv_results.csv'
 $script:LogFile = Join-Path ([Environment]::GetFolderPath('MyDocuments')) ("DvdToMkv_{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
 $script:Ffmpeg = $null
 $script:Ffprobe = $null
@@ -126,6 +130,76 @@ function Get-MkvAudioCount([string]$file) {
     } catch { return 0 }
 }
 
+function Get-MkvSubCount([string]$file) {
+    $ErrorActionPreference = 'Continue'
+    try {
+        $o = & $script:Ffprobe -v error -f matroska -select_streams s -show_entries stream=index -of 'csv=p=0' $file 2>$null
+        return @($o | Where-Object { $_ }).Count
+    } catch { return 0 }
+}
+
+# Length of the movie as FFmpeg reads it from the DVD's own index files; 0 if it can't tell.
+function Get-DvdDuration([string]$folder) {
+    $ErrorActionPreference = 'Continue'
+    try {
+        $o = & $script:Ffprobe -v error -f dvdvideo -show_entries format=duration -of 'default=nw=1:nk=1' $folder 2>$null
+        $o = $o | Select-Object -First 1
+        $v = [double]::Parse(([string]$o).Trim(), [Globalization.CultureInfo]::InvariantCulture)
+        if ($v -gt 0) { return $v } else { return 0 }
+    } catch { return 0 }
+}
+
+function Get-FreeGB([string]$path) {
+    $p = $path.Trim().Trim('"')
+    while ($p -and -not (Test-Path -LiteralPath $p)) {
+        $parent = Split-Path $p -Parent
+        if ($parent -eq $p) { break }
+        $p = $parent
+    }
+    if (-not $p) { return -1 }
+    $f = [DiskInfo]::FreeBytes($p.TrimEnd('\') + '\')
+    if ($f -lt 0) { return -1 }
+    return [math]::Round([double]$f / 1GB)
+}
+
+function Get-Prop($o, [string]$name, $default) {
+    $p = $o.PSObject.Properties[$name]
+    if ($p) { return $p.Value } else { return $default }
+}
+
+function Add-Result($it, $r, [string]$outcome, [int]$secs) {
+    $row = [pscustomobject]@{
+        Time = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); Genre = $it.Genre; Name = $it.Name; Result = $outcome
+        Note = (Get-Prop $r 'Note' ''); DvdGB = [math]::Round([double]$it.Bytes / 1GB, 2)
+        MkvGB = [math]::Round([double](Get-Prop $r 'Size' 0) / 1GB, 2)
+        MkvLength = (Format-Span ([double](Get-Prop $r 'Duration' 0)))
+        DvdLength = (Format-Span ([double](Get-Prop $r 'SrcDuration' 0)))
+        AudioTracks = (Get-Prop $r 'Audio' ''); SubtitleTracks = (Get-Prop $r 'Subs' '')
+        Seconds = $secs; Input = $it.Input; Output = $it.Out
+    }
+    try { $row | Export-Csv -LiteralPath $script:ResultsFile -Append -NoTypeInformation -Encoding UTF8 } catch { }
+}
+
+function Update-Selection {
+    if ($script:Bulk) { return }
+    $n = 0; $bytes = [double]0
+    foreach ($lvi in $script:lv.Items) {
+        $it = $lvi.Tag
+        if ($lvi.Checked -and ($it.Status -eq 'Waiting' -or $it.Status -like 'FAILED*')) { $n++; $bytes += [double]$it.Bytes }
+    }
+    $gb = $bytes / 1GB
+    $text = ('Ticked: {0} movies, {1:N0} GB' -f $n, $gb)
+    $script:lblSel.ForeColor = [System.Drawing.Color]::FromArgb(230, 232, 238)
+    if ($script:FreeGB -ge 0) {
+        $text += ('     Free on the output drive: {0:N0} GB' -f $script:FreeGB)
+        if ($n -gt 0 -and ($gb * 1.05 + 20) -gt $script:FreeGB) {
+            $text += '     NOT ENOUGH ROOM - untick some'
+            $script:lblSel.ForeColor = [System.Drawing.Color]::FromArgb(240, 110, 110)
+        }
+    }
+    $script:lblSel.Text = $text
+}
+
 # ---------------------------------------------------------------- scanning
 
 function Get-Dvds([string]$src, [string]$out) {
@@ -170,7 +244,8 @@ function Set-ItemStatus($item, [string]$status) {
     $item.Status = $status
     if ($item.LvItem) {
         $item.LvItem.SubItems[3].Text = $status
-        if ($status -eq 'Done') { $item.LvItem.ForeColor = [System.Drawing.Color]::FromArgb(110, 210, 140) }
+        if ($status -like 'Done - CHECK*') { $item.LvItem.ForeColor = [System.Drawing.Color]::FromArgb(240, 160, 70) }
+        elseif ($status -like 'Done*') { $item.LvItem.ForeColor = [System.Drawing.Color]::FromArgb(110, 210, 140) }
         elseif ($status -like 'FAILED*') { $item.LvItem.ForeColor = [System.Drawing.Color]::FromArgb(240, 110, 110) }
         elseif ($status -like 'Converting*') {
             $item.LvItem.ForeColor = [System.Drawing.Color]::FromArgb(240, 200, 90)
@@ -243,6 +318,7 @@ function Convert-One($item) {
     $size = (Get-Item -LiteralPath $part).Length
     $dur = Get-MkvDuration $part
     $aud = Get-MkvAudioCount $part
+    $subs = Get-MkvSubCount $part
     $ratio = [double]$size / [math]::Max([double]1, [double]$item.Bytes)
     $problems = @()
     if ($dur -le 0) { $problems += 'no length found' }
@@ -255,8 +331,22 @@ function Convert-One($item) {
         return [pscustomobject]@{ Ok = $false; Fatal = $false; Note = 'Check failed: ' + ($problems -join ', ') }
     }
 
+    # Compare with the length the DVD itself reports. A difference is flagged, not failed.
+    $srcDur = Get-DvdDuration $item.Input
+    $flag = ''
+    if ($srcDur -gt 0) {
+        $diff = [math]::Abs($dur - $srcDur)
+        if ($diff -gt [math]::Max([double]90, $srcDur * 0.03)) {
+            $flag = ('MKV is {0}, DVD says {1}' -f (Format-Span $dur), (Format-Span $srcDur))
+        }
+    }
+
     Move-Item -LiteralPath $part -Destination $item.Out -Force
-    return [pscustomobject]@{ Ok = $true; Fatal = $false; Note = ('{0}, {1:N2} GB, {2} audio tracks' -f (Format-Span $dur), ($size / 1GB), $aud); Duration = $dur }
+    return [pscustomobject]@{
+        Ok = $true; Fatal = $false; Flag = $flag
+        Note = ('{0}, {1:N2} GB, {2} audio, {3} subtitle tracks' -f (Format-Span $dur), ($size / 1GB), $aud, $subs)
+        Duration = $dur; SrcDuration = $srcDur; Size = $size; Audio = $aud; Subs = $subs
+    }
 }
 
 function Start-Batch($items, [string]$outRoot) {
@@ -268,7 +358,7 @@ function Start-Batch($items, [string]$outRoot) {
     $script:DoneBytes = [long]0
     $script:DoneCount = 0
     $script:BatchStart = Get-Date
-    $ok = 0; $failed = 0
+    $ok = 0; $failed = 0; $flagged = 0
 
     Write-Log ("Starting: {0} movies, {1:N0} GB, output {2}" -f $todo.Count, ($script:TotalBytes / 1GB), $outRoot)
     foreach ($it in $todo) {
@@ -291,8 +381,16 @@ function Start-Batch($items, [string]$outRoot) {
 
         if ($r.Ok) {
             $ok++
-            Set-ItemStatus $it 'Done'
-            Write-Log ("OK     {0}\{1}  ({2}, took {3}s)" -f $it.Genre, $it.Name, $r.Note, $secs)
+            if ($r.Flag) {
+                $flagged++
+                Set-ItemStatus $it ('Done - CHECK: ' + $r.Flag)
+                Write-Log ("CHECK  {0}\{1}  {2}  ({3})" -f $it.Genre, $it.Name, $r.Flag, $r.Note)
+                Add-Result $it $r 'CHECK' $secs
+            } else {
+                Set-ItemStatus $it 'Done'
+                Write-Log ("OK     {0}\{1}  ({2}, took {3}s)" -f $it.Genre, $it.Name, $r.Note, $secs)
+                Add-Result $it $r 'OK' $secs
+            }
         } elseif ($r.PSObject.Properties['Stopped'] -and $r.Stopped) {
             Set-ItemStatus $it 'Waiting'
             Write-Log ("STOP   {0}\{1}" -f $it.Genre, $it.Name)
@@ -301,13 +399,14 @@ function Start-Batch($items, [string]$outRoot) {
             $failed++
             Set-ItemStatus $it ('FAILED: ' + $r.Note)
             Write-Log ("FAILED {0}\{1}  {2}" -f $it.Genre, $it.Name, $r.Note)
+            Add-Result $it $r 'FAILED' $secs
             if ($r.Fatal) { Write-Log 'Stopping: free up space on the output drive and start again.'; break }
         }
         $script:DoneBytes += $it.Bytes
         $script:DoneCount++
     }
-    Write-Log ("Finished: {0} converted, {1} failed, log: {2}" -f $ok, $failed, $script:LogFile)
-    return [pscustomobject]@{ Ok = $ok; Failed = $failed }
+    Write-Log ("Finished: {0} converted ({1} to check), {2} failed. Results: {3}" -f $ok, $flagged, $failed, $script:ResultsFile)
+    return [pscustomobject]@{ Ok = $ok; Failed = $failed; Flagged = $flagged }
 }
 
 # ---------------------------------------------------------------- window
@@ -367,6 +466,13 @@ function Show-Gui {
     $script:btnScan = New-Button 'Scan' 16 140 90 $true
     $btnAll = New-Button 'Tick all' 116 140 90 $false
     $btnNone = New-Button 'Untick all' 216 140 100 $false
+    $script:cmbGenre = New-Object System.Windows.Forms.ComboBox
+    $script:cmbGenre.Location = New-Object System.Drawing.Point(334, 142)
+    $script:cmbGenre.Size = New-Object System.Drawing.Size(250, 28)
+    $script:cmbGenre.DropDownStyle = 'DropDownList'
+    $script:cmbGenre.BackColor = $panel; $script:cmbGenre.ForeColor = $fg; $script:cmbGenre.FlatStyle = 'Flat'
+    $form.Controls.Add($script:cmbGenre)
+    $btnGenre = New-Button 'Tick genre' 594 140 100 $false
     $script:btnStart = New-Button 'Start' 760 140 100 $true
     $script:btnStart.Anchor = 'Top,Right'
     $script:btnStop = New-Button 'Stop' 868 140 100 $false
@@ -375,7 +481,7 @@ function Show-Gui {
 
     $script:lv = New-Object System.Windows.Forms.ListView
     $script:lv.Location = New-Object System.Drawing.Point(16, 182)
-    $script:lv.Size = New-Object System.Drawing.Size(970, 330)
+    $script:lv.Size = New-Object System.Drawing.Size(970, 300)
     $script:lv.Anchor = 'Top,Left,Right,Bottom'
     $script:lv.View = 'Details'; $script:lv.CheckBoxes = $true; $script:lv.FullRowSelect = $true
     $script:lv.BackColor = $panel; $script:lv.ForeColor = $fg; $script:lv.BorderStyle = 'None'
@@ -384,6 +490,9 @@ function Show-Gui {
     [void]$script:lv.Columns.Add('GB', 70)
     [void]$script:lv.Columns.Add('Status', 420)
     $form.Controls.Add($script:lv)
+
+    $script:lblSel = New-Label 'Ticked: 0 movies' 16 488 970
+    $script:lblSel.Anchor = 'Bottom,Left,Right'
 
     $script:lblStatus = New-Label 'Press Scan to look for DVDs.' 16 522 970
     $script:lblStatus.Anchor = 'Bottom,Left,Right'
@@ -417,9 +526,34 @@ function Show-Gui {
     $btnOut.Add_Click({ & $script:browse $script:txtOut })
 
     $btnAll.Add_Click({
+        $script:Bulk = $true
         foreach ($lvi in $script:lv.Items) { $s = $lvi.Tag.Status; if ($s -eq 'Waiting' -or $s -like 'FAILED*') { $lvi.Checked = $true } }
+        $script:Bulk = $false
+        Update-Selection
     })
-    $btnNone.Add_Click({ foreach ($lvi in $script:lv.Items) { $lvi.Checked = $false } })
+    $btnNone.Add_Click({
+        $script:Bulk = $true
+        foreach ($lvi in $script:lv.Items) { $lvi.Checked = $false }
+        $script:Bulk = $false
+        Update-Selection
+    })
+    $btnGenre.Add_Click({
+        $i = $script:cmbGenre.SelectedIndex
+        if ($i -lt 0) { return }
+        $g = $script:GenreNames[$i]
+        $script:Bulk = $true
+        foreach ($lvi in $script:lv.Items) {
+            $it = $lvi.Tag
+            if ($it.Genre -eq $g -and ($it.Status -eq 'Waiting' -or $it.Status -like 'FAILED*')) { $lvi.Checked = $true }
+        }
+        $script:Bulk = $false
+        Update-Selection
+    })
+    $script:lv.Add_ItemChecked({ Update-Selection })
+    $script:txtOut.Add_Leave({
+        $script:FreeGB = Get-FreeGB $script:txtOut.Text
+        Update-Selection
+    })
 
     $script:btnScan.Add_Click({
         $src = $script:txtSrc.Text.Trim().Trim('"')
@@ -445,6 +579,19 @@ function Show-Gui {
             Set-ItemStatus $it $it.Status
         }
         $script:lv.EndUpdate()
+        $script:cmbGenre.Items.Clear()
+        $script:GenreNames = @()
+        foreach ($g in ($script:Items | Group-Object Genre | Sort-Object Name)) {
+            $w = @($g.Group | Where-Object { $_.Status -eq 'Waiting' })
+            if ($w.Count -eq 0) { continue }
+            $b = [double]0
+            foreach ($x in $w) { $b += [double]$x.Bytes }
+            [void]$script:cmbGenre.Items.Add(('{0}  ({1} movies, {2:N0} GB)' -f $g.Name, $w.Count, ($b / 1GB)))
+            $script:GenreNames += $g.Name
+        }
+        if ($script:cmbGenre.Items.Count -gt 0) { $script:cmbGenre.SelectedIndex = 0 }
+        $script:FreeGB = Get-FreeGB $out
+        Update-Selection
         $waiting = @($script:Items | Where-Object { $_.Status -eq 'Waiting' })
         $gb = 0; foreach ($w in $waiting) { $gb += $w.Bytes }
         $nDone = @($script:Items | Where-Object { $_.Status -eq 'Done' }).Count
@@ -464,13 +611,23 @@ function Show-Gui {
         }
         $out = $script:txtOut.Text.Trim().Trim('"')
         if (-not $out) { [void][System.Windows.Forms.MessageBox]::Show('Choose where to save the MKV files.', 'DVD to MKV'); return }
+        $selBytes = [double]0
+        foreach ($s in $sel) { $selBytes += [double]$s.Bytes }
+        $free = Get-FreeGB $out
+        if ($free -ge 0 -and (($selBytes / 1GB) * 1.05 + 20) -gt $free) {
+            $msg = ('You ticked about {0:N0} GB but the output drive has {1:N0} GB free. It will stop when it runs out of room. Continue anyway?' -f ($selBytes / 1GB), $free)
+            $ans = [System.Windows.Forms.MessageBox]::Show($msg, 'DVD to MKV', 'YesNo', 'Warning')
+            if ($ans -ne 'Yes') { return }
+        }
         $script:btnScan.Enabled = $false; $script:btnStart.Enabled = $false; $script:btnStop.Enabled = $true
         $script:Running = $true
         try { $r = Start-Batch $sel $out } finally { $script:Running = $false }
         $script:btnStop.Enabled = $false; $script:btnScan.Enabled = $true; $script:btnStart.Enabled = $true
         $script:pbCur.Value = 0
         $script:lblCur.Text = 'Now: -'
-        $script:lblStatus.Text = ('Finished: {0} converted, {1} failed. Failed ones can be ticked and retried.' -f $r.Ok, $r.Failed)
+        $script:FreeGB = Get-FreeGB $out
+        Update-Selection
+        $script:lblStatus.Text = ('Finished: {0} converted ({1} marked CHECK), {2} failed. Details are in DvdToMkv_results.csv in Documents.' -f $r.Ok, $r.Flagged, $r.Failed)
     })
 
     $script:btnStop.Add_Click({
