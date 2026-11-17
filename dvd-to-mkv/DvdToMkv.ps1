@@ -467,12 +467,12 @@ function Show-Gui {
     $btnAll = New-Button 'Tick all' 116 140 90 $false
     $btnNone = New-Button 'Untick all' 216 140 100 $false
     $script:cmbGenre = New-Object System.Windows.Forms.ComboBox
-    $script:cmbGenre.Location = New-Object System.Drawing.Point(334, 142)
-    $script:cmbGenre.Size = New-Object System.Drawing.Size(250, 28)
+    $script:cmbGenre.Location = New-Object System.Drawing.Point(16, 182)
+    $script:cmbGenre.Size = New-Object System.Drawing.Size(300, 28)
     $script:cmbGenre.DropDownStyle = 'DropDownList'
     $script:cmbGenre.BackColor = $panel; $script:cmbGenre.ForeColor = $fg; $script:cmbGenre.FlatStyle = 'Flat'
     $form.Controls.Add($script:cmbGenre)
-    $btnGenre = New-Button 'Tick genre' 594 140 100 $false
+    $btnGenre = New-Button 'Tick genre' 326 180 100 $false
     $script:btnStart = New-Button 'Start' 760 140 100 $true
     $script:btnStart.Anchor = 'Top,Right'
     $script:btnStop = New-Button 'Stop' 868 140 100 $false
@@ -480,8 +480,8 @@ function Show-Gui {
     $script:btnStop.Enabled = $false
 
     $script:lv = New-Object System.Windows.Forms.ListView
-    $script:lv.Location = New-Object System.Drawing.Point(16, 182)
-    $script:lv.Size = New-Object System.Drawing.Size(970, 300)
+    $script:lv.Location = New-Object System.Drawing.Point(16, 220)
+    $script:lv.Size = New-Object System.Drawing.Size(970, 262)
     $script:lv.Anchor = 'Top,Left,Right,Bottom'
     $script:lv.View = 'Details'; $script:lv.CheckBoxes = $true; $script:lv.FullRowSelect = $true
     $script:lv.BackColor = $panel; $script:lv.ForeColor = $fg; $script:lv.BorderStyle = 'None'
