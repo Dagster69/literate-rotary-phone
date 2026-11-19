@@ -34,6 +34,10 @@ The converter never deletes anything itself.
 - Each finished movie is compared with the length the DVD itself reports. If they differ by more than 90 seconds or 3%, the status shows an orange **Done - CHECK** and the file is kept, so you can look at it.
 - `DvdToMkv_results.csv` in Documents has one row per movie: result, DVD and MKV sizes and lengths, number of audio and subtitle tracks, and the paths. Open it in Excel and filter the Result column for CHECK or FAILED, and sort by SubtitleTracks to spot any that came out with none.
 
+## Deleting the originals (only after you have checked the results)
+
+`Run-DeleteConvertedOriginals.bat` reads `DvdToMkv_results.csv` and lists the original DVD folders whose movie converted OK and whose MKV exists and is a sensible size. Nothing is deleted until you type `DELETE`. CHECK and FAILED movies are never touched. Only the `VIDEO_TS` folder is removed; the movie folder is removed only if it is then empty, so moviesheets and posters stay. The plan is saved as `DvdToMkv_delete_plan.csv` so you can look at it in Excel first. Afterwards, empty the NAS recycle bin or the space is not freed.
+
 ## Retrying failures
 
 Press **Scan**, then **Tick retries**. It ticks every movie whose latest result in `DvdToMkv_results.csv` was FAILED or CHECK and that has no MKV now. To redo a movie that finished as CHECK, delete its MKV and folder first.
