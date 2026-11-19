@@ -279,6 +279,11 @@ function Invoke-Ffmpeg([string]$argStr, $item, [string]$part) {
     $p = Start-Process -FilePath $script:Ffmpeg -ArgumentList $argStr -NoNewWindow -PassThru -RedirectStandardError $errFile
     $null = $p.Handle
 
+    # Watchdog: if the output file has not grown for 5 minutes, FFmpeg is hung (for example on an
+    # unreadable file on the NAS), so stop it and let the caller treat it as a failure.
+    $lastSize = [long]-1
+    $lastChange = Get-Date
+    $stalled = $false
     while (-not $p.HasExited) {
         Start-Sleep -Milliseconds 400
         Pump
@@ -286,15 +291,25 @@ function Invoke-Ffmpeg([string]$argStr, $item, [string]$part) {
         $cur = [long]0
         if (Test-Path -LiteralPath $part) { try { $cur = (Get-Item -LiteralPath $part).Length } catch { } }
         Update-Progress $item $cur
+        if ($cur -ne $lastSize) {
+            $lastSize = $cur
+            $lastChange = Get-Date
+        } elseif (((Get-Date) - $lastChange).TotalSeconds -gt 300) {
+            $stalled = $true
+            try { $p.Kill() } catch { }
+            break
+        }
     }
-    $p.WaitForExit()
+    [void]$p.WaitForExit(15000)
 
     $tail = ''
     if (Test-Path -LiteralPath $errFile) {
         $tail = (Get-Content -LiteralPath $errFile -Tail 3 -ErrorAction SilentlyContinue) -join ' | '
         Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
     }
-    return [pscustomobject]@{ ExitCode = $p.ExitCode; Stopped = [bool]$script:StopRequested; Tail = $tail }
+    $code = -1
+    if ($p.HasExited) { $code = $p.ExitCode }
+    return [pscustomobject]@{ ExitCode = $code; Stopped = [bool]$script:StopRequested; Stalled = $stalled; Tail = $tail }
 }
 
 # Checks a finished .partial file and compares its length with the DVD's own length.
@@ -406,7 +421,8 @@ function Convert-One($item) {
     $why = ''
     $method = 'DVD'
     $res = $null
-    if ($run.ExitCode -ne 0) { $why = "FFmpeg error $($run.ExitCode): $($run.Tail)" }
+    if ($run.Stalled) { $why = 'Stalled: no progress for 5 minutes' }
+    elseif ($run.ExitCode -ne 0) { $why = "FFmpeg error $($run.ExitCode): $($run.Tail)" }
     elseif (-not (Test-Path -LiteralPath $part)) { $why = 'FFmpeg produced no file' }
     else {
         $res = Test-Mkv $part $item
@@ -426,6 +442,10 @@ function Convert-One($item) {
             Start-Sleep -Milliseconds 500
             Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
             return [pscustomobject]@{ Ok = $false; Fatal = $false; Stopped = $true; Note = 'Stopped' }
+        }
+        if ($run.Stalled) {
+            Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+            return [pscustomobject]@{ Ok = $false; Fatal = $false; Note = "$why; VOB method also stalled: no progress for 5 minutes (file may be unreadable on the NAS)" }
         }
         if ($run.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $part)) {
             Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
