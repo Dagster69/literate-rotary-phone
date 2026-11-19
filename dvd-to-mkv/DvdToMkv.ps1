@@ -571,6 +571,7 @@ function Show-Gui {
     $script:cmbGenre.BackColor = $panel; $script:cmbGenre.ForeColor = $fg; $script:cmbGenre.FlatStyle = 'Flat'
     $form.Controls.Add($script:cmbGenre)
     $btnGenre = New-Button 'Tick genre' 326 180 100 $false
+    $btnRetry = New-Button 'Tick retries' 436 180 110 $false
     $script:btnStart = New-Button 'Start' 760 140 100 $true
     $script:btnStart.Anchor = 'Top,Right'
     $script:btnStop = New-Button 'Stop' 868 140 100 $false
@@ -647,6 +648,24 @@ function Show-Gui {
         $script:Bulk = $false
         Update-Selection
     })
+    # Ticks movies whose latest result in DvdToMkv_results.csv was FAILED or CHECK and that have no MKV now.
+    $btnRetry.Add_Click({
+        if (-not (Test-Path -LiteralPath $script:ResultsFile)) {
+            [void][System.Windows.Forms.MessageBox]::Show('There is no results file yet.', 'DVD to MKV'); return
+        }
+        $latest = @{}
+        foreach ($row in (Import-Csv -LiteralPath $script:ResultsFile)) { $latest[($row.Genre + '|' + $row.Name)] = $row.Result }
+        $script:Bulk = $true
+        $n = 0
+        foreach ($lvi in $script:lv.Items) {
+            $it = $lvi.Tag
+            $res = $latest[($it.Genre + '|' + $it.Name)]
+            if (($res -eq 'FAILED' -or $res -eq 'CHECK') -and ($it.Status -eq 'Waiting' -or $it.Status -like 'FAILED*')) { $lvi.Checked = $true; $n++ }
+        }
+        $script:Bulk = $false
+        Update-Selection
+        $script:lblStatus.Text = ('{0} movies that failed or were flagged earlier are now ticked.' -f $n)
+    })
     $script:lv.Add_ItemChecked({ Update-Selection })
     $script:txtOut.Add_Leave({
         $script:FreeGB = Get-FreeGB $script:txtOut.Text
@@ -722,7 +741,9 @@ function Show-Gui {
         try { $r = Start-Batch $sel $out } finally { $script:Running = $false }
         $script:btnStop.Enabled = $false; $script:btnScan.Enabled = $true; $script:btnStart.Enabled = $true
         $script:pbCur.Value = 0
+        $script:pbAll.Value = 0
         $script:lblCur.Text = 'Now: -'
+        $script:lblAll.Text = 'Overall: -'
         $script:FreeGB = Get-FreeGB $out
         Update-Selection
         $script:lblStatus.Text = ('Finished: {0} converted ({1} marked CHECK), {2} failed. Details are in DvdToMkv_results.csv in Documents.' -f $r.Ok, $r.Flagged, $r.Failed)

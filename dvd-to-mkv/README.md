@@ -34,6 +34,10 @@ The converter never deletes anything itself.
 - Each finished movie is compared with the length the DVD itself reports. If they differ by more than 90 seconds or 3%, the status shows an orange **Done - CHECK** and the file is kept, so you can look at it.
 - `DvdToMkv_results.csv` in Documents has one row per movie: result, DVD and MKV sizes and lengths, number of audio and subtitle tracks, and the paths. Open it in Excel and filter the Result column for CHECK or FAILED, and sort by SubtitleTracks to spot any that came out with none.
 
+## Retrying failures
+
+Press **Scan**, then **Tick retries**. It ticks every movie whose latest result in `DvdToMkv_results.csv` was FAILED or CHECK and that has no MKV now. To redo a movie that finished as CHECK, delete its MKV and folder first.
+
 ## Two ways of reading a DVD
 
 1. **Normal method** (fast, about 1 to 5 minutes): FFmpeg reads the DVD through its own navigation. This keeps chapters and the language names of the audio and subtitle tracks.
