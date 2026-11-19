@@ -175,7 +175,7 @@ function Add-Result($it, $r, [string]$outcome, [int]$secs) {
         MkvLength = (Format-Span ([double](Get-Prop $r 'Duration' 0)))
         DvdLength = (Format-Span ([double](Get-Prop $r 'SrcDuration' 0)))
         AudioTracks = (Get-Prop $r 'Audio' ''); SubtitleTracks = (Get-Prop $r 'Subs' '')
-        Seconds = $secs; Input = $it.Input; Output = $it.Out
+        Method = (Get-Prop $r 'Method' ''); Seconds = $secs; Input = $it.Input; Output = $it.Out
     }
     try { $row | Export-Csv -LiteralPath $script:ResultsFile -Append -NoTypeInformation -Encoding UTF8 } catch { }
 }
@@ -273,19 +273,9 @@ function Update-Progress($item, [long]$curBytes) {
     }
 }
 
-function Convert-One($item) {
-    $outDir = Split-Path $item.Out -Parent
-    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-    $part = $item.Out + '.partial'
+function Invoke-Ffmpeg([string]$argStr, $item, [string]$part) {
     $errFile = Join-Path $env:TEMP ('dvdtomkv_err_{0}.txt' -f [guid]::NewGuid().ToString('N'))
     if (Test-Path -LiteralPath $part) { Remove-Item -LiteralPath $part -Force }
-
-    $free = [DiskInfo]::FreeBytes($outDir.TrimEnd('\') + '\')
-    if ($free -ge 0 -and $free -lt ($item.Bytes * 1.1 + 5GB)) {
-        return [pscustomobject]@{ Ok = $false; Fatal = $true; Note = 'Not enough free space on the output drive' }
-    }
-
-    $argStr = '-y -nostdin -nostats -loglevel warning -f dvdvideo -i "{0}" -map 0 -c copy -bsf:s "noise=drop=floor(pts*tb/21600)" -f matroska "{1}"' -f $item.Input, $part
     $p = Start-Process -FilePath $script:Ffmpeg -ArgumentList $argStr -NoNewWindow -PassThru -RedirectStandardError $errFile
     $null = $p.Handle
 
@@ -304,17 +294,11 @@ function Convert-One($item) {
         $tail = (Get-Content -LiteralPath $errFile -Tail 3 -ErrorAction SilentlyContinue) -join ' | '
         Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
     }
+    return [pscustomobject]@{ ExitCode = $p.ExitCode; Stopped = [bool]$script:StopRequested; Tail = $tail }
+}
 
-    if ($script:StopRequested) {
-        Start-Sleep -Milliseconds 500
-        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
-        return [pscustomobject]@{ Ok = $false; Fatal = $false; Stopped = $true; Note = 'Stopped' }
-    }
-    if ($p.ExitCode -ne 0) {
-        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
-        return [pscustomobject]@{ Ok = $false; Fatal = $false; Note = "FFmpeg error $($p.ExitCode): $tail" }
-    }
-
+# Checks a finished .partial file and compares its length with the DVD's own length.
+function Test-Mkv([string]$part, $item) {
     $size = (Get-Item -LiteralPath $part).Length
     $dur = Get-MkvDuration $part
     $aud = Get-MkvAudioCount $part
@@ -326,26 +310,140 @@ function Convert-One($item) {
     elseif ($dur -gt 21600) { $problems += ('length is {0} (timestamp fault)' -f (Format-Span $dur)) }
     if ($aud -lt 1) { $problems += 'no audio track' }
     if ($ratio -lt 0.7 -or $ratio -gt 1.3) { $problems += ('size is {0:P0} of the DVD' -f $ratio) }
-    if ($problems.Count -gt 0) {
-        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
-        return [pscustomobject]@{ Ok = $false; Fatal = $false; Note = 'Check failed: ' + ($problems -join ', ') }
+
+    $srcDur = Get-DvdDuration $item.Input
+    $short = $false
+    $flag = ''
+    if ($srcDur -gt 0 -and $dur -gt 0) {
+        $diff = $dur - $srcDur
+        $tol = [math]::Max([double]90, $srcDur * 0.03)
+        if ([math]::Abs($diff) -gt $tol) {
+            $flag = ('MKV is {0}, DVD says {1}' -f (Format-Span $dur), (Format-Span $srcDur))
+            if ($diff -lt 0) { $short = $true }
+        }
+    }
+    return [pscustomobject]@{ Size = $size; Dur = $dur; Aud = $aud; Subs = $subs; Problems = $problems; SrcDur = $srcDur; Flag = $flag; Short = $short }
+}
+
+# Builds the FFmpeg arguments for the fallback: join the VOB files of the main title set and
+# read them as a plain video stream, ignoring the DVD index files. Returns $null if there are none.
+function Get-VobArgs($item, [string]$part) {
+    $ErrorActionPreference = 'Continue'
+    $dir = Join-Path $item.Input 'VIDEO_TS'
+    if (-not (Test-Path -LiteralPath $dir)) { return $null }
+
+    $sets = @{}
+    foreach ($f in (Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)) {
+        if ($f.Name -match '^VTS_(\d\d)_([1-9]\d*)\.VOB$') {
+            $k = $Matches[1]
+            if (-not $sets.ContainsKey($k)) { $sets[$k] = New-Object System.Collections.ArrayList }
+            [void]$sets[$k].Add([pscustomobject]@{ N = [int]$Matches[2]; Path = $f.FullName; Len = $f.Length })
+        }
+    }
+    if ($sets.Count -eq 0) { return $null }
+
+    $best = $null
+    $bestLen = [long]-1
+    foreach ($k in $sets.Keys) {
+        $len = [long]0
+        foreach ($v in $sets[$k]) { $len += $v.Len }
+        if ($len -gt $bestLen) { $bestLen = $len; $best = $sets[$k] }
+    }
+    $paths = @($best | Sort-Object N | ForEach-Object { $_.Path })
+    $concat = 'concat:' + ($paths -join '|')
+
+    # Put the audio tracks in DVD stream order (0x80, 0x81, ...) and keep the first as default.
+    $audio = @()
+    try {
+        $json = (& $script:Ffprobe -v error -probesize 200M -analyzeduration 200M -show_entries stream=index,codec_type,codec_name,id -of json $concat 2>$null | Out-String) | ConvertFrom-Json
+        foreach ($s in $json.streams) {
+            if ($s.codec_type -eq 'audio') {
+                $sid = 0
+                try { $sid = [Convert]::ToInt32(([string]$s.id).Replace('0x', ''), 16) } catch { }
+                $audio += [pscustomobject]@{ Index = [int]$s.index; Id = $sid; Codec = [string]$s.codec_name }
+            }
+        }
+    } catch { }
+
+    $maps = '-map 0:v:0'
+    $over = ''
+    $disp = ''
+    if ($audio.Count -gt 0) {
+        $k = 0
+        foreach ($a in ($audio | Sort-Object Id, Index)) {
+            $maps += (' -map 0:{0}' -f $a.Index)
+            if ($a.Codec -eq 'pcm_dvd') { $over += (' -c:a:{0} pcm_s24le' -f $k) }
+            if ($k -eq 0) { $disp += ' -disposition:a:0 default' } else { $disp += (' -disposition:a:{0} 0' -f $k) }
+            $k++
+        }
+    } else {
+        $maps += ' -map 0:a'
+    }
+    $maps += ' -map 0:s?'
+
+    return ('-y -nostdin -nostats -loglevel warning -fflags +genpts -probesize 200M -analyzeduration 200M -i "{0}" {1} -c copy{2}{3} -bsf:s "noise=drop=floor(pts*tb/21600)" -f matroska "{4}"' -f $concat, $maps, $over, $disp, $part)
+}
+
+function Convert-One($item) {
+    $outDir = Split-Path $item.Out -Parent
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    $part = $item.Out + '.partial'
+
+    $free = [DiskInfo]::FreeBytes($outDir.TrimEnd('\') + '\')
+    if ($free -ge 0 -and $free -lt ($item.Bytes * 1.1 + 5GB)) {
+        return [pscustomobject]@{ Ok = $false; Fatal = $true; Note = 'Not enough free space on the output drive' }
     }
 
-    # Compare with the length the DVD itself reports. A difference is flagged, not failed.
-    $srcDur = Get-DvdDuration $item.Input
-    $flag = ''
-    if ($srcDur -gt 0) {
-        $diff = [math]::Abs($dur - $srcDur)
-        if ($diff -gt [math]::Max([double]90, $srcDur * 0.03)) {
-            $flag = ('MKV is {0}, DVD says {1}' -f (Format-Span $dur), (Format-Span $srcDur))
+    # First try: let FFmpeg read the DVD through its own navigation (keeps chapters and language labels).
+    $dvdArgs = '-y -nostdin -nostats -loglevel warning -f dvdvideo -i "{0}" -map 0 -c copy -bsf:s "noise=drop=floor(pts*tb/21600)" -f matroska "{1}"' -f $item.Input, $part
+    $run = Invoke-Ffmpeg $dvdArgs $item $part
+    if ($run.Stopped) {
+        Start-Sleep -Milliseconds 500
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        return [pscustomobject]@{ Ok = $false; Fatal = $false; Stopped = $true; Note = 'Stopped' }
+    }
+
+    $why = ''
+    $method = 'DVD'
+    $res = $null
+    if ($run.ExitCode -ne 0) { $why = "FFmpeg error $($run.ExitCode): $($run.Tail)" }
+    elseif (-not (Test-Path -LiteralPath $part)) { $why = 'FFmpeg produced no file' }
+    else {
+        $res = Test-Mkv $part $item
+        if ($res.Problems.Count -gt 0) { $why = 'Check failed: ' + ($res.Problems -join ', ') }
+        elseif ($res.Short) { $why = 'Too short: ' + $res.Flag }
+    }
+
+    if ($why) {
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        Write-Log ('       {0}: normal method failed ({1}). Trying the direct VOB method...' -f $item.Name, $why)
+        $vobArgs = Get-VobArgs $item $part
+        if (-not $vobArgs) {
+            return [pscustomobject]@{ Ok = $false; Fatal = $false; Note = $why + ' (no VOB files for the fallback)' }
         }
+        $run = Invoke-Ffmpeg $vobArgs $item $part
+        if ($run.Stopped) {
+            Start-Sleep -Milliseconds 500
+            Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+            return [pscustomobject]@{ Ok = $false; Fatal = $false; Stopped = $true; Note = 'Stopped' }
+        }
+        if ($run.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $part)) {
+            Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+            return [pscustomobject]@{ Ok = $false; Fatal = $false; Note = "$why; VOB method also failed: FFmpeg error $($run.ExitCode): $($run.Tail)" }
+        }
+        $res = Test-Mkv $part $item
+        if ($res.Problems.Count -gt 0) {
+            Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+            return [pscustomobject]@{ Ok = $false; Fatal = $false; Note = "$why; VOB method: Check failed: " + ($res.Problems -join ', ') }
+        }
+        $method = 'VOB'
     }
 
     Move-Item -LiteralPath $part -Destination $item.Out -Force
     return [pscustomobject]@{
-        Ok = $true; Fatal = $false; Flag = $flag
-        Note = ('{0}, {1:N2} GB, {2} audio, {3} subtitle tracks' -f (Format-Span $dur), ($size / 1GB), $aud, $subs)
-        Duration = $dur; SrcDuration = $srcDur; Size = $size; Audio = $aud; Subs = $subs
+        Ok = $true; Fatal = $false; Flag = $res.Flag; Method = $method
+        Note = ('{0}, {1:N2} GB, {2} audio, {3} subtitle tracks, {4} method' -f (Format-Span $res.Dur), ($res.Size / 1GB), $res.Aud, $res.Subs, $method)
+        Duration = $res.Dur; SrcDuration = $res.SrcDur; Size = $res.Size; Audio = $res.Aud; Subs = $res.Subs
     }
 }
 

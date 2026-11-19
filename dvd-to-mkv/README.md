@@ -34,6 +34,13 @@ The converter never deletes anything itself.
 - Each finished movie is compared with the length the DVD itself reports. If they differ by more than 90 seconds or 3%, the status shows an orange **Done - CHECK** and the file is kept, so you can look at it.
 - `DvdToMkv_results.csv` in Documents has one row per movie: result, DVD and MKV sizes and lengths, number of audio and subtitle tracks, and the paths. Open it in Excel and filter the Result column for CHECK or FAILED, and sort by SubtitleTracks to spot any that came out with none.
 
+## Two ways of reading a DVD
+
+1. **Normal method** (fast, about 1 to 5 minutes): FFmpeg reads the DVD through its own navigation. This keeps chapters and the language names of the audio and subtitle tracks.
+2. **Direct VOB method** (slower, about 15 to 20 minutes): used automatically when the normal method fails, gives an empty file, or comes out shorter than the DVD says. Some DVD Cloner copies have broken index files that stop the normal method. This method joins the `VTS_xx_n.VOB` files of the main title and ignores the index files. The movie, audio and subtitles are kept, but chapters and language names are lost. Audio tracks are put in DVD order, with the first as the default, and uncompressed (LPCM) audio is converted to lossless PCM so it fits in MKV.
+
+The results spreadsheet has a **Method** column showing which one each movie used.
+
 ## How it behaves
 
 - **Safe to stop and restart.** Each file is written as `.partial` and only renamed once it passes checks (sensible length, has audio, size close to the DVD). Finished movies show as Done and are skipped next time.
